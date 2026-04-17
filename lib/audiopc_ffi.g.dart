@@ -105,3 +105,6 @@ external int audiopc_get_thumbnail(
   int max_len,
   ffi.Pointer<ffi.Char> path,
 );
+
+@ffi.Native<ffi.Int32 Function()>()
+external int audiopc_get_player_state();

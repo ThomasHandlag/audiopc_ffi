@@ -18,7 +18,7 @@ use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
-use symphonia::core::meta::{MetadataOptions, StandardVisualKey};
+use symphonia::core::meta::{MetadataOptions};
 use symphonia::core::probe::Hint;
 
 const DEFAULT_MAX_QUEUE_SECONDS: usize = 20;
@@ -373,7 +373,10 @@ pub struct AudioEngine {
     visualizer_processor: VisualizerProcessor,
     source_duration_millis: i32,
     decode_start_millis: i32,
+    audio_stream: Option<Stream>,
 }
+
+
 
 impl AudioEngine {
     pub fn new() -> Result<Self, String> {
@@ -403,6 +406,7 @@ impl AudioEngine {
             visualizer_processor: VisualizerProcessor::new(DEFAULT_VISUALIZER_BAR_COUNT),
             source_duration_millis: -1,
             decode_start_millis: 0,
+            audio_stream: None,
         })
     }
 
@@ -472,8 +476,8 @@ impl AudioEngine {
             .play()
             .map_err(|e| format!("Failed to start output stream: {e}"))?;
 
-        // Keep the CPAL stream alive for the process lifetime.
-        let _leaked: &'static mut Stream = Box::leak(Box::new(stream));
+        // Keep the CPAL stream alive for the AudioEngine's lifetime.
+        self.audio_stream = Some(stream);
         self.stream_started = true;
         Ok(())
     }
@@ -650,6 +654,24 @@ impl AudioEngine {
         }
     }
 
+    pub fn get_state(&self) -> PlayerState {
+        if self.source.is_none() {
+            return PlayerState::Idle;
+        }
+        match self.shared.lock() {
+            Ok(shared) => {
+                if shared.playing {
+                    PlayerState::Playing
+                } else if shared.stream_finished {
+                    PlayerState::Stopped
+                } else {
+                    PlayerState::Paused
+                }
+            }
+            Err(_) => PlayerState::Idle,
+        }
+    }
+
     pub fn is_source_loaded(&self) -> i32 {
         i32::from(self.source.is_some())
     }
@@ -720,34 +742,14 @@ impl AudioEngine {
         // Extract tags from metadata
         
         probed.metadata.get().iter().for_each(|c_metadata| {
-
-            let o_metadata = c_metadata.current().unwrap_or_else(|| {
-                panic!("Metadata entry without current metadata? This should not happen.");
-            });
-
-            for visual in o_metadata.visuals() {
-            // Filter for front cover specifically
-            if visual.usage == Some(StandardVisualKey::FrontCover) {
-                println!("Found cover art!");
-                println!("MIME type: {}", visual.media_type);
-                println!("Size: {} bytes", visual.data.len());
-
-                // Save it to a file
-                let ext = if visual.media_type == "image/png" { "png" } else { "jpg" };
-                let mut out = File::create(format!("e:/downloads/cover.{}", ext)).unwrap();
-                std::io::copy(&mut &visual.data[..], &mut out).unwrap();
-                println!("Saved to cover.{}", ext);
-                break;
+            if let Some(o_metadata) = c_metadata.current() {
+                for tag in o_metadata.tags() {
+                    let key = tag.key.to_lowercase();
+                    let value = tag.value.to_string();
+                    metadata.insert(key, value);
                 }
             }
-            
-            for tag in o_metadata.tags() {
-                let key = tag.key.to_lowercase();
-                let value = tag.value.to_string();
-                metadata.insert(key, value);
-            }
-        });
-        
+        });        
 
         // Extract codec parameters
         let track = match probed
@@ -810,20 +812,14 @@ impl AudioEngine {
         .map_err(|e| format!("Failed to probe source for thumbnail: {e}"))?;
 
         for c_metadata in probed.metadata.get().iter() {
-            let o_metadata = c_metadata.current().unwrap_or_else(|| {
-                panic!("Metadata entry without current metadata? This should not happen.");
-            });
-            
-            for visual in o_metadata.visuals() {
-                println!("MIME type: {}", visual.media_type);
-                println!("Size: {} bytes", visual.data.len());
-            // Filter for front cover specifically
-            if visual.usage == Some(StandardVisualKey::FrontCover) {
-                    return Ok(visual.data.to_vec());
+            if let Some(o_metadata) = c_metadata.current() {
+                for visual in o_metadata.visuals() {
+                    if visual.media_type == "image/jpeg" || visual.media_type == "image/png" {
+                        return Ok(visual.data.to_vec());
+                    }
                 }
             }
         }
-
         Ok(Vec::new())
     }
 
@@ -862,6 +858,8 @@ fn write_bytes_to_temp_file(bytes: &[u8], tag: &str) -> Result<File, String> {
 
 use std::io::{Read, Seek, SeekFrom};
 use reqwest::blocking::Client;
+
+use crate::player_state::PlayerState;
 
 struct HttpStream {
     url: reqwest::Url,

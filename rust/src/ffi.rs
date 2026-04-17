@@ -5,10 +5,9 @@ use std::sync::Mutex;
 use log::error;
 use once_cell::sync::Lazy;
 
-use crate::engine::{
-    default_output_channels, default_output_sample_rate, output_device_count, AudioEngine,
-    AudioSource,
-};
+use crate::{engine::{
+    AudioEngine, AudioSource, default_output_channels, default_output_sample_rate, output_device_count
+}, player_state::PlayerState};
 
 static ENGINE: Lazy<Mutex<Option<AudioEngine>>> = Lazy::new(|| Mutex::new(None));
 
@@ -399,4 +398,14 @@ pub extern "C" fn audiopc_get_thumbnail(buffer: *mut u8, max_len: i32, path: *co
         }
 
         copy_len as i32    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn audiopc_get_player_state() -> i32 {
+    with_engine_ref(|engine| match engine.get_state() {
+        PlayerState::Idle => 0,
+        PlayerState::Playing => 1,
+        PlayerState::Paused => 2,
+        PlayerState::Stopped => 3,
+    })
 }

@@ -61,3 +61,5 @@ int32_t audiopc_copy_visualizer_spectrum(float *buffer, int32_t max_bars);
 int32_t audiopc_get_metadata(char *buffer, int32_t max_len, const char *path);
 
 int32_t audiopc_get_thumbnail(uint8_t *buffer, int32_t max_len, const char *path);
+
+int32_t audiopc_get_player_state(void);

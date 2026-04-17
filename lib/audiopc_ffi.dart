@@ -1,17 +1,18 @@
+export 'package:audiopc_interface/audiopc_interface.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:typed_data';
 
-
 import 'package:audiopc_interface/audiopc_interface.dart';
 import 'package:ffi/ffi.dart';
 import 'dart:developer';
 
-import 'audiopc.g.dart' as bindings;
+import 'audiopc_ffi.g.dart' as bindings;
 
 /// Native player implementation backed by Rust FFI.
-class AudiopcNative with StateMixin implements AudiopcInterface  {
+class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   static bool _ok(int code) => code == 0;
 
   late final Timer _positionTimer;
@@ -29,7 +30,13 @@ class AudiopcNative with StateMixin implements AudiopcInterface  {
   /// Creates a player and starts a periodic position publisher.
   AudiopcNative() {
     _positionTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      positionStreamController.add(positionMillis);
+      if (state == PlayerState.playing) {
+        positionController.add(positionMillis);
+      }
+      final stateCode = bindings.audiopc_get_player_state();
+      if (stateCode >= 0 && stateCode < PlayerState.values.length) {
+        setState(PlayerState.values[stateCode]);
+      }
     });
   }
 
@@ -173,7 +180,7 @@ class AudiopcNative with StateMixin implements AudiopcInterface  {
         growable: false,
       );
     } finally {
-      malloc.free(ptr);
+      calloc.free(ptr);
     }
   }
 
@@ -223,7 +230,7 @@ class AudiopcNative with StateMixin implements AudiopcInterface  {
       return MetaData.fromJson(jsonData);
     } finally {
       calloc.free(ptr);
-      malloc.free(urlPtr);
+      calloc.free(urlPtr);
     }
   }
 
@@ -234,7 +241,7 @@ class AudiopcNative with StateMixin implements AudiopcInterface  {
     try {
       // First, query size (requires API change to support this)
       // For now, allocate a reasonable max size
-      const maxThumbnailSize = 10 * 1024 * 1024; // 10MB max
+      const maxThumbnailSize = 20 * 1024 * 1024; // 20MB max
       final ptr = calloc<ffi.Uint8>(maxThumbnailSize);
       if (ptr == ffi.nullptr) {
         throw Exception('Failed to allocate thumbnail buffer');
@@ -256,7 +263,7 @@ class AudiopcNative with StateMixin implements AudiopcInterface  {
         calloc.free(ptr);
       }
     } finally {
-      calloc.free(urlPtr);
+      malloc.free(urlPtr);
     }
   }
 
@@ -265,13 +272,13 @@ class AudiopcNative with StateMixin implements AudiopcInterface  {
   void dispose() {
     stop();
     _positionTimer.cancel();
-    positionStreamController.close();
-    stateStreamController.close();
+    positionController.close();
+    playerStateController.close();
   }
-  
+
   @override
-  Stream<int> get positionStream => positionStreamController.stream;
-  
+  Stream<int> get positionStream => positionController.stream;
+
   @override
-  StreamController<int> get positionStreamController => StreamController.broadcast();
+  Stream<PlayerState> get stateStream => playerStateController.stream;
 }

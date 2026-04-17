@@ -2,6 +2,7 @@
 
 mod engine;
 mod ffi;
+mod player_state;
 
 #[cfg(target_os = "android")]
 mod android_init {
