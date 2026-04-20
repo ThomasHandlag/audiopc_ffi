@@ -7,7 +7,6 @@ import 'dart:typed_data';
 
 import 'package:audiopc_interface/audiopc_interface.dart';
 import 'package:ffi/ffi.dart';
-import 'dart:developer';
 
 import 'audiopc_ffi.g.dart' as bindings;
 
@@ -16,6 +15,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   static bool _ok(int code) => code == 0;
 
   late final Timer _positionTimer;
+  late final Timer _stateTimer;
 
   /// Reads backend capabilities from the Rust/CPAL layer.
   @override
@@ -33,6 +33,11 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
       if (state == PlayerState.playing) {
         positionController.add(positionMillis);
       }
+    });
+
+    _stateTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      // Polling for state changes is not ideal, but the Rust backend does not currently support callbacks.
+      // In a future iteration, we could add a callback mechanism to notify Dart of state changes immediately.
       final stateCode = bindings.audiopc_get_player_state();
       if (stateCode >= 0 && stateCode < PlayerState.values.length) {
         setState(PlayerState.values[stateCode]);
@@ -106,7 +111,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   bool stop() {
     final isOk = _ok(bindings.audiopc_stop());
     if (isOk) {
-      setState(PlayerState.idle);
+      setState(PlayerState.stopped);
     }
     return isOk;
   }
@@ -212,20 +217,19 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   /// Retrieves the current metadata snapshot from the native backend.
   @override
   MetaData getMetadata(String url) {
-    final ptr = calloc<ffi.Char>(1024);
+    const maxLen = 8192; // Must match Rust buffer size
+    final ptr = calloc<ffi.Char>(maxLen);
     final urlPtr = url.toNativeUtf8();
     try {
       if (ptr == ffi.nullptr) {
         throw Exception('Failed to retrieve metadata');
       }
-      final result = bindings.audiopc_get_metadata(ptr, 1024, urlPtr.cast());
+      final result = bindings.audiopc_get_metadata(ptr, maxLen, urlPtr.cast());
       if (result < 0) {
         throw Exception('Failed to retrieve metadata (error code: $result)');
       }
       final jsonString = ptr.cast<Utf8>().toDartString();
       final jsonData = jsonDecode(jsonString) as Map<String, dynamic>;
-
-      log('Metadata JSON: $jsonString');
 
       return MetaData.fromJson(jsonData);
     } finally {
@@ -236,7 +240,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
 
   /// Retrieves the thumbnail image data from the native backend.
   @override
-  Uint8List? getThumbnail(String url) {
+  Uint8List? getThumbnail(String url, {int maxSizeBytes = 20 * 1024 * 1024}) {
     final urlPtr = url.toNativeUtf8().cast<ffi.Char>();
     try {
       // First, query size (requires API change to support this)
@@ -263,15 +267,16 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
         calloc.free(ptr);
       }
     } finally {
-      malloc.free(urlPtr);
+      calloc.free(urlPtr);
     }
-  }
-
+  }  
+  
   /// Stops playback and releases timers and stream controllers.
   @override
   void dispose() {
     stop();
     _positionTimer.cancel();
+    _stateTimer.cancel();
     positionController.close();
     playerStateController.close();
   }
