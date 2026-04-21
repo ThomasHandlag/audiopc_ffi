@@ -2,14 +2,50 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Mutex;
 
-use log::error;
 use once_cell::sync::Lazy;
 
-use crate::{engine::{
-    AudioEngine, AudioSource, default_output_channels, default_output_sample_rate, output_device_count
-}, player_state::PlayerState};
+use crate::{
+    engine::{
+        AudioEngine,default_output_channels, 
+        default_output_sample_rate, output_device_count
+    }, 
+    player_state::PlayerState, source::AudioSource,
+    error
+};
 
 static ENGINE: Lazy<Mutex<Option<AudioEngine>>> = Lazy::new(|| Mutex::new(None));
+
+fn with_engine<F, R>(mut f: F) -> R
+where
+    F: FnMut(&mut AudioEngine) -> R,
+{
+    let mut guard = match ENGINE.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            error!("Engine mutex is poisoned");
+            panic!("Engine mutex is poisoned");
+        }
+    };
+
+    if guard.is_none() {
+        match AudioEngine::new() {
+            Ok(engine) => {
+                *guard = Some(engine);
+            }
+            Err(err) => {
+                error!("Engine initialization failed: {err}");
+                panic!("Engine initialization failed: {err}");
+            }
+        }
+    }
+
+    let Some(engine) = guard.as_mut() else {
+        error!("Engine initialization failed: missing engine state");
+        panic!("Engine initialization failed: missing engine state");
+    };
+
+    f(engine)
+}
 
 fn with_engine_mut<F>(mut f: F) -> i32
 where
@@ -168,14 +204,6 @@ pub extern "C" fn audiopc_stop() -> i32 {
 pub extern "C" fn audiopc_set_volume(volume: f64) -> i32 {
     with_engine_mut(|engine| {
         engine.set_volume(volume as f32);
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn audiopc_set_lowpass_hz(hz: f64) -> i32 {
-    with_engine_mut(|engine| {
-        engine.set_lowpass_hz(hz as f32);
         Ok(())
     })
 }
@@ -408,4 +436,89 @@ pub unsafe extern "C" fn audiopc_get_player_state() -> i32 {
         PlayerState::Paused => 2,
         PlayerState::Stopped => 3,
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_rate(rate: f32) -> i32 {
+    with_engine_mut_i32(|engine| {
+        engine.set_rate(rate);
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_comb_filter(delay_ms: f32, feedback: f32) -> i32 {
+    with_engine_mut_i32(|engine| {
+        engine.set_comb_filter(delay_ms, feedback);
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_peak_filter(center_hz: f32, gain_db: f32, q: f32) -> i32 {
+    with_engine_mut(|engine| {
+        engine.set_peak_filter(center_hz, gain_db, q);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_low_shelf_filter(cutoff_hz: f32, gain_db: f32, q: f32) -> i32 {
+    with_engine_mut(|engine| {
+        engine.set_low_shelf_filter(cutoff_hz, gain_db, q);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_high_shelf_filter(cutoff_hz: f32, gain_db: f32, q: f32) -> i32 {
+    with_engine_mut(|engine| {
+        engine.set_high_shelf_filter(cutoff_hz, gain_db, q);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_band_pass_filter(center_hz: f32, q: f32) -> i32 {
+    with_engine_mut(|engine| {
+        engine.set_band_pass_filter(center_hz, q);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_notch_filter(center_hz: f32, q: f32) -> i32 {
+    with_engine_mut(|engine| {
+        engine.set_notch_filter(center_hz, q);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_lowpass_hz(cutoff_hz: f64, q: f32) -> i32 {
+    with_engine_mut(|engine| {
+        engine.set_lowpass_filter(cutoff_hz as f32, q);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_set_high_pass_filter(cutoff_hz: f32, q: f32) -> i32 {
+    with_engine_mut(|engine| {
+        engine.set_high_pass_filter(cutoff_hz, q);
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_clear_filters() -> i32 {
+    with_engine_mut(|engine| {
+        engine.clear_filters();
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn audiopc_get_rate() -> f32 {
+    with_engine(|engine| engine.rate())
 }

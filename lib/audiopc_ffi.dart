@@ -240,7 +240,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
 
   /// Retrieves the thumbnail image data from the native backend.
   @override
-  Uint8List? getThumbnail(String url, {int maxSizeBytes = 20 * 1024 * 1024}) {
+  Uint8List? getThumbnail(String url, {int maxSize = 20 * 1024 * 1024}) {
     final urlPtr = url.toNativeUtf8().cast<ffi.Char>();
     try {
       // First, query size (requires API change to support this)
@@ -269,8 +269,8 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
     } finally {
       calloc.free(urlPtr);
     }
-  }  
-  
+  }
+
   /// Stops playback and releases timers and stream controllers.
   @override
   void dispose() {
@@ -286,4 +286,115 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
 
   @override
   Stream<PlayerState> get stateStream => playerStateController.stream;
+
+  /// Sets playback rate where 1.0 is normal speed.
+  bool setPlaybackRate(double rate) => _ok(bindings.audiopc_set_rate(rate));
+
+  /// Gets the current playback rate.
+  double get playbackRate => bindings.audiopc_get_rate();
+
+  /// Sets high-pass cutoff in Hz. Use 0 to disable filtering.
+  ///
+  /// A high-pass filter allows frequencies above the specified cutoff frequency to pass through while attenuating frequencies below it.
+  bool setHighPassHz(double hz) {
+    final code = bindings.audiopc_set_high_pass_filter(
+      hz,
+      0.707,
+    ); // Using a default Q of 0.707 for a Butterworth response
+    return _ok(code);
+  }
+
+  /// Permits frequencies within a specific range while attenuating those outside of it.
+  ///
+  /// The `min` parameter specifies the lower cutoff frequency in Hz,
+  /// while the `max` parameter specifies the upper cutoff frequency in Hz.
+  bool setBandPassFilter(double min, double max) {
+    final code = bindings.audiopc_set_band_pass_filter(min, max);
+    return _ok(code);
+  }
+
+  /// Boosts or cuts frequencies around a center frequency in Hz,
+  /// with a specified gain in dB and quality factor Q.
+  ///
+  /// The `centerHz` parameter specifies the center frequency of the peak filter in Hz,
+  /// which determines the frequency around which the boost or cut is applied.
+  /// The `gainDb` parameter controls the amount of boost or cut applied to frequencies around the center frequency,
+  /// where a positive value results in a boost and a negative value results in a cut.
+  ///
+  /// The `q` parameter controls the quality factor of the filter,
+  /// which affects the bandwidth of the boost or cut around the center frequency.
+  /// A higher Q value results in a narrower bandwidth,
+  /// while a lower Q value results in a wider bandwidth.
+  bool setPeakFilter(double centerHz, double gainDb, double q) {
+    final code = bindings.audiopc_set_peak_filter(centerHz, gainDb, q);
+    return _ok(code);
+  }
+
+  /// Sets a low shelving filter with a specified cutoff frequency in Hz,
+  /// gain in dB, and quality factor Q.
+  ///
+  /// The `cutoffHz` parameter specifies the cutoff frequency of the low shelf filter in Hz,
+  /// which determines the point at which the filter starts to boost or cut frequencies.
+  ///
+  /// The `gainDb` parameter controls the amount of boost or cut applied to frequencies below the cutoff frequency,
+  /// where a positive value results in a boost and a negative value results in a cut.
+  ///
+  /// The `q` parameter controls the quality factor of the filter,
+  /// which affects the slope of the boost or cut around the cutoff frequency.
+  bool setLowShelfFilter(double cutoffHz, double gainDb, double q) {
+    final code = bindings.audiopc_set_low_shelf_filter(cutoffHz, gainDb, q);
+    return _ok(code);
+  }
+
+  /// Sets a high shelving filter with a specified cutoff frequency in Hz,
+  /// gain in dB, and quality factor Q.
+  ///
+  /// The `cutoffHz` parameter specifies the cutoff frequency of the high shelf filter in Hz,
+  /// which determines the point at which the filter starts to boost or cut frequencies.
+  ///
+  /// The `gainDb` parameter controls the amount of boost or cut applied to frequencies above the cutoff frequency,
+  /// where a positive value results in a boost and a negative value results in a cut.
+  ///
+  /// The `q` parameter controls the quality factor of the filter,
+  /// which affects the slope of the boost or cut around the cutoff frequency.
+  /// A higher Q value results in a steeper slope, while a lower Q value results in a gentler slope.
+  bool setHighShelfFilter(double cutoffHz, double gainDb, double q) {
+    final code = bindings.audiopc_set_high_shelf_filter(cutoffHz, gainDb, q);
+    return _ok(code);
+  }
+
+  /// Sets a comb filter with a specified delay in milliseconds, feedback level, and damping factor.
+  ///
+  /// The `delayMs` parameter specifies the delay time of the comb filter in milliseconds,
+  /// which determines the spacing of the notches in the frequency response.
+  ///
+  /// The `feedback` parameter controls the amount of the delayed signal that is fed back into the input,
+  /// where a value of 0 means no feedback and values closer to 1 result in a more pronounced comb filtering effect.
+  ///
+  /// The `damp` parameter controls the damping of the comb filter,
+  /// which affects the decay of the notches in the frequency response.
+  bool setCombFilter(double delayMs, double feedback, double damp) {
+    final code = bindings.audiopc_set_comb_filter(delayMs, feedback);
+    return _ok(code);
+  }
+
+  /// T-notch filter or band-rejection filter is a filter that passes most frequencies unaltered,
+  /// but attenuates those in a specific range to very low levels.
+  ///
+  /// The `centerHz` parameter specifies the center frequency of the notch in Hz,
+  /// while `bandwidthHz` defines the width of the notch in Hz.
+  ///
+  /// The `gainDb` parameter allows for adjusting the depth of the notch,
+  /// where a more negative value results in a deeper notch.
+  bool setNotchFilter(double centerHz, double q) {
+    final code = bindings.audiopc_set_notch_filter(centerHz, q);
+
+    return _ok(code);
+  }
+
+  /// Clears all active filters and returns to a clean signal path.
+  bool clearFilter() {
+    final code = bindings.audiopc_clear_filters();
+    return _ok(code);
+  }
 }

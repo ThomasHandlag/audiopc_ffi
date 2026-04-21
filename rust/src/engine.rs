@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use std::fs::File;
+use std::process::exit;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,376 +9,70 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
-use log::error;
-use rustfft::num_complex::Complex;
-use rustfft::num_traits::Zero;
-use rustfft::{Fft, FftPlanner};
+use biquad::{ Coefficients, DirectForm1, ToHertz};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::{MetadataOptions};
 use symphonia::core::probe::Hint;
 
-const DEFAULT_MAX_QUEUE_SECONDS: usize = 20;
-const MIN_MAX_QUEUE_SECONDS: usize = 1;
-const MAX_MAX_QUEUE_SECONDS: usize = 120;
-const DECODE_BACKPRESSURE_SLEEP_MS: u64 = 2;
-const DEFAULT_VISUALIZER_SECONDS: usize = 2;
-const VISUALIZER_FFT_SIZE: usize = 1024;
-const DEFAULT_VISUALIZER_BAR_COUNT: usize = 64;
-const VISUALIZER_MIN_HZ: f32 = 35.0;
+use crate::{
+    effects::Effects,
+    enums::{DECODE_BACKPRESSURE_SLEEP_MS, DEFAULT_VISUALIZER_BAR_COUNT, MAX_RATE, MIN_RATE},
+    processor::VisualizerProcessor,
+    source::AudioSource,
+    http_stream::HttpStream,
+    player_state::{PlayerState, ResampleState, SharedPlayback},
+    info, error, warn,
+};
 
-struct VisualizerProcessor {
-    fft: std::sync::Arc<dyn Fft<f32>>,
-    fft_buffer: Vec<Complex<f32>>,
-    smoothed_bars: Vec<f32>,
-    adaptive_level: f32,
-    fast_energy: f32,
-    slow_energy: f32,
-}
-
-impl VisualizerProcessor {
-    fn new(bar_count: usize) -> Self {
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(VISUALIZER_FFT_SIZE);
-        Self {
-            fft,
-            fft_buffer: vec![Complex::zero(); VISUALIZER_FFT_SIZE],
-            smoothed_bars: vec![0.0; bar_count.max(1)],
-            adaptive_level: 0.08,
-            fast_energy: 0.0,
-            slow_energy: 0.0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.smoothed_bars.fill(0.0);
-        self.adaptive_level = 0.08;
-        self.fast_energy = 0.0;
-        self.slow_energy = 0.0;
-    }
-
-    fn ensure_bar_count(&mut self, count: usize) {
-        let count = count.max(1);
-        if self.smoothed_bars.len() != count {
-            self.smoothed_bars = vec![0.0; count];
-            self.adaptive_level = 0.08;
-        }
-    }
-
-    fn decay_only(&mut self, out: &mut [f32]) -> i32 {
-        self.ensure_bar_count(out.len());
-        for value in &mut self.smoothed_bars {
-            *value *= 0.93;
-        }
-        self.fast_energy *= 0.90;
-        self.slow_energy *= 0.97;
-        for (index, value) in out.iter_mut().enumerate() {
-            *value = self.smoothed_bars[index];
-        }
-        out.len() as i32
-    }
-
-    fn compute(&mut self, samples: &[f32], channels: usize, sample_rate: u32, out: &mut [f32], playing: bool) -> i32 {
-        if out.is_empty() {
-            return 0;
-        }
-
-        self.ensure_bar_count(out.len());
-
-        if !playing || samples.is_empty() || channels == 0 || sample_rate == 0 {
-            return self.decay_only(out);
-        }
-
-        let frame_count = samples.len() / channels;
-        if frame_count == 0 {
-            return self.decay_only(out);
-        }
-
-        let window_frames = VISUALIZER_FFT_SIZE.min(frame_count);
-        let start_frame = frame_count.saturating_sub(window_frames);
-
-        self.fft_buffer.fill(Complex::zero());
-
-        let mut rms_acc = 0.0f32;
-        for index in 0..window_frames {
-            let src_frame = start_frame + index;
-            let mut mixed = 0.0f32;
-            for ch in 0..channels {
-                mixed += samples[src_frame * channels + ch];
-            }
-            let mono = mixed / channels as f32;
-            rms_acc += mono * mono;
-
-            let target = VISUALIZER_FFT_SIZE - window_frames + index;
-            self.fft_buffer[target].re = mono * hann_window(index, window_frames);
-        }
-
-        self.fft.process(&mut self.fft_buffer);
-
-        let half = VISUALIZER_FFT_SIZE / 2;
-        let mut magnitudes = vec![0.0f32; half];
-        let norm = window_frames.max(1) as f32;
-        for (bin, value) in self.fft_buffer.iter().take(half).enumerate() {
-            magnitudes[bin] = (value.re * value.re + value.im * value.im).sqrt() / norm;
-        }
-
-        let rms = (rms_acc / window_frames.max(1) as f32).sqrt();
-        self.fast_energy = self.fast_energy * 0.50 + rms * 0.50;
-        self.slow_energy = self.slow_energy * 0.97 + rms * 0.03;
-        let beat = ((self.fast_energy - self.slow_energy) * 11.0).clamp(0.0, 1.0);
-
-        let min_hz = VISUALIZER_MIN_HZ;
-        let max_hz = ((sample_rate as f32) * 0.46).max(min_hz + 1.0);
-        let bar_count = out.len();
-        let mut raw_bars = vec![0.0f32; bar_count];
-
-        for bar in 0..bar_count {
-            let t0 = bar as f32 / bar_count as f32;
-            let t1 = (bar + 1) as f32 / bar_count as f32;
-            let f0 = log_interp(min_hz, max_hz, t0);
-            let f1 = log_interp(min_hz, max_hz, t1);
-
-            let b0 = hz_to_bin(f0, sample_rate, VISUALIZER_FFT_SIZE).max(1);
-            let b1 = hz_to_bin(f1, sample_rate, VISUALIZER_FFT_SIZE).max(b0 + 1);
-            let end = b1.min(magnitudes.len());
-            let start = b0.min(end.saturating_sub(1));
-
-            let mut energy = 0.0f32;
-            let mut count = 0usize;
-            for value in &magnitudes[start..end] {
-                energy += *value;
-                count += 1;
-            }
-
-            let mut raw = if count > 0 { energy / count as f32 } else { 0.0 };
-            raw *= 1.0 + beat * 0.55 * (1.0 - t0);
-            raw_bars[bar] = raw;
-        }
-
-        let frame_peak = raw_bars.iter().copied().fold(0.0f32, f32::max);
-        self.adaptive_level = self.adaptive_level * 0.95 + frame_peak.max(0.0001) * 0.05;
-        let level = self.adaptive_level.max(0.0001);
-
-        let mut spatial = vec![0.0f32; bar_count];
-        for index in 0..bar_count {
-            let left = if index > 0 { raw_bars[index - 1] } else { raw_bars[index] };
-            let center = raw_bars[index];
-            let right = if index + 1 < bar_count {
-                raw_bars[index + 1]
-            } else {
-                raw_bars[index]
-            };
-            spatial[index] = left * 0.20 + center * 0.60 + right * 0.20;
-        }
-
-        for (index, raw) in spatial.iter().enumerate() {
-            let mut target = (raw / level).clamp(0.0, 2.0);
-            target = target.powf(0.78) * 0.70;
-            target = target.clamp(0.0, 1.0);
-
-            let current = self.smoothed_bars[index];
-            let alpha = if target > current { 0.34 } else { 0.08 };
-            self.smoothed_bars[index] = current + (target - current) * alpha;
-            out[index] = self.smoothed_bars[index];
-        }
-
-        bar_count as i32
-    }
-}
-
-#[derive(Clone)]
-pub enum AudioSource {
-    Path(String),
-    Url(String),
-    Memory(Vec<u8>),
-}
-
-struct ResampleState {
-    pos: f64,
-    carry: Vec<f32>,
-}
-
-impl ResampleState {
-    fn new() -> Self {
-        Self {
-            pos: 0.0,
-            carry: Vec::new(),
-        }
-    }
-}
-
-struct SharedPlayback {
-    queue: VecDeque<f32>,
-    visualizer_ring: VecDeque<f32>,
-    visualizer_max_samples: usize,
-    max_samples: usize,
-    max_queue_seconds: usize,
-    playing: bool,
-    stream_finished: bool,
-    volume: f32,
-    lowpass_hz: f32,
-    lowpass_alpha: f32,
-    lowpass_prev: Vec<f32>,
-    emitted_samples: u64,
-    source_offset_samples: u64,
-    sample_rate: u32,
-}
-
-impl SharedPlayback {
-    fn new(channels: usize, sample_rate: u32) -> Self {
-        let max_samples = sample_rate
-            .saturating_mul(channels as u32)
-            .saturating_mul(DEFAULT_MAX_QUEUE_SECONDS as u32) as usize;
-        let visualizer_max_samples = sample_rate
-            .saturating_mul(channels as u32)
-            .saturating_mul(DEFAULT_VISUALIZER_SECONDS as u32) as usize;
-        Self {
-            queue: VecDeque::with_capacity(max_samples),
-            visualizer_ring: VecDeque::with_capacity(visualizer_max_samples),
-            visualizer_max_samples,
-            max_samples,
-            max_queue_seconds: DEFAULT_MAX_QUEUE_SECONDS,
-            playing: false,
-            stream_finished: true,
-            volume: 1.0,
-            lowpass_hz: 0.0,
-            lowpass_alpha: 0.0,
-            lowpass_prev: vec![0.0; channels],
-            emitted_samples: 0,
-            source_offset_samples: 0,
-            sample_rate,
-        }
-    }
-
-    fn clear_audio_state(&mut self) {
-        self.queue.clear();
-        self.visualizer_ring.clear();
-        self.lowpass_prev.fill(0.0);
-        self.emitted_samples = 0;
-        self.source_offset_samples = 0;
-        self.stream_finished = true;
-    }
-
-    fn push_visualizer_sample(&mut self, sample: f32) {
-        if self.visualizer_max_samples == 0 {
-            return;
-        }
-
-        if self.visualizer_ring.len() >= self.visualizer_max_samples {
-            let _ = self.visualizer_ring.pop_front();
-        }
-
-        self.visualizer_ring.push_back(sample);
-    }
-
-    fn copy_latest_visualizer_samples(&self, out: &mut [f32]) -> usize {
-        if out.is_empty() || self.visualizer_ring.is_empty() {
-            return 0;
-        }
-
-        let count = out.len().min(self.visualizer_ring.len());
-        let skip = self.visualizer_ring.len().saturating_sub(count);
-
-        for (index, sample) in self
-            .visualizer_ring
-            .iter()
-            .skip(skip)
-            .take(count)
-            .enumerate()
-        {
-            out[index] = *sample;
-        }
-
-        count
-    }
-
-    fn recalc_lowpass_alpha(&mut self) {
-        if self.lowpass_hz <= 0.0 {
-            self.lowpass_alpha = 0.0;
-            return;
-        }
-
-        let dt = 1.0 / self.sample_rate.max(1) as f32;
-        let rc = 1.0 / (2.0 * std::f32::consts::PI * self.lowpass_hz.max(1.0));
-        self.lowpass_alpha = dt / (rc + dt);
-    }
-
-    fn set_max_queue_seconds(&mut self, channels: usize, seconds: usize) {
-        let bounded = seconds.clamp(MIN_MAX_QUEUE_SECONDS, MAX_MAX_QUEUE_SECONDS);
-        self.max_queue_seconds = bounded;
-        self.max_samples = self
-            .sample_rate
-            .saturating_mul(channels as u32)
-            .saturating_mul(bounded as u32) as usize;
-
-        while self.queue.len() > self.max_samples {
-            let _ = self.queue.pop_front();
-        }
-
-        if self.queue.capacity() < self.max_samples {
-            self.queue
-                .reserve(self.max_samples.saturating_sub(self.queue.capacity()));
-        }
-    }
-
-    fn push_samples_bounded(&mut self, samples: &[f32]) -> usize {
-        let available = self.max_samples.saturating_sub(self.queue.len());
-        let push_count = samples.len().min(available);
-        self.queue.extend(samples.iter().take(push_count).copied());
-        push_count
-    }
-
-    fn next_sample(&mut self, channel: usize) -> f32 {
-        if !self.playing {
-            return 0.0;
-        }
-
-        let raw = if let Some(sample) = self.queue.pop_front() {
-            self.emitted_samples = self.emitted_samples.saturating_add(1);
-            sample
-        } else {
-            if self.stream_finished {
-                self.playing = false;
-            }
-            return 0.0;
-        };
-
-        let mut sample = raw * self.volume;
-
-        if self.lowpass_alpha > 0.0 {
-            let alpha = self.lowpass_alpha;
-            let prev = self.lowpass_prev[channel];
-            let filtered = prev + alpha * (sample - prev);
-            self.lowpass_prev[channel] = filtered;
-            sample = filtered;
-        }
-
-        let sample = sample.clamp(-1.0, 1.0);
-        self.push_visualizer_sample(sample);
-        sample
-    }
-}
-
+/// The main audio engine struct that manages audio playback, decoding, and processing.
 pub struct AudioEngine {
+    /// Shared state between the audio output callback and the main thread. 
+    /// This includes the playback queue, visualizer data, and playback parameters.
     shared: Arc<Mutex<SharedPlayback>>,
+
+    /// Flag indicating whether the audio stream has been started.
     stream_started: bool,
+
+    /// The currently loaded audio source, which can be a file or a URL.
     source: Option<AudioSource>,
+
+    /// Thread handle for the decode thread, 
+    /// which is responsible for decoding the audio source and feeding it into the playback queue.
     decode_thread: Option<JoinHandle<()>>,
+
+    /// Flag to signal the decode thread to stop. This is used when changing sources or stopping playback.
     decode_stop: Arc<AtomicBool>,
+
+    /// Number of output channels, determined from the audio device configuration. 
+    /// This is used for resampling and buffering calculations.
     out_channels: usize,
+
+    /// Output sample rate, determined from the audio device configuration.
     out_sample_rate: u32,
+
+    /// Processor for computing visualizer data from the audio samples. 
+    /// This is used to generate the spectrum data for the visualizer.
     visualizer_processor: VisualizerProcessor,
+
+    /// Estimated duration of the loaded audio source in milliseconds. 
+    /// This is calculated when a source is loaded and can be used for seeking and displaying duration.
     source_duration_millis: i32,
+
+    /// The starting position for decoding in milliseconds. 
+    /// This is updated when seeking to indicate where the decode thread should start decoding from.
     decode_start_millis: i32,
+
+    /// The CPAL audio stream. This is kept as a field to ensure it stays alive for the lifetime of the AudioEngine.
     audio_stream: Option<Stream>,
 }
 
-
-
 impl AudioEngine {
+    /// Create a new instance of the audio engine. 
+    /// This initializes the shared state and sets up the audio configuration.
     pub fn new() -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host
@@ -392,6 +86,7 @@ impl AudioEngine {
         let out_channels = config.channels() as usize;
         let out_sample_rate = config.sample_rate();
 
+        info!("Engine Initialized");
         Ok(Self {
             shared: Arc::new(Mutex::new(SharedPlayback::new(
                 out_channels,
@@ -410,6 +105,12 @@ impl AudioEngine {
         })
     }
 
+    /// Initialize the audio output stream. 
+    /// This is called lazily when playback starts to avoid issues on platforms 
+    /// where the audio device may not be ready at app startup.
+    /// 
+    /// Returns an error if the stream fails to initialize, 
+    /// which can happen if the audio device is unavailable.
     pub fn ensure_stream(&mut self) -> Result<(), String> {
         if self.stream_started {
             return Ok(());
@@ -435,9 +136,9 @@ impl AudioEngine {
         let channels = self.out_channels;
 
         let err_fn = |err| {
-            eprintln!("CPAL stream error: {err}");
+            error!("CPAL stream error: {err}");
         };
-
+ 
         let stream = match sample_format {
             SampleFormat::F32 => device
                 .build_output_stream(
@@ -482,6 +183,12 @@ impl AudioEngine {
         Ok(())
     }
 
+    /// Set the audio source to be played. This can be a file path or a URL.
+     /// The source is loaded and decoded in a separate thread to avoid blocking the main thread.
+     /// If a source is already playing, it will be stopped and replaced with the new source.
+     /// 
+     /// Returns an error if the source fails to load, which can happen if the file doesn't exist
+     /// or if there's a network error when loading from a URL.
     pub fn set_source(&mut self, source: AudioSource) {
         self.source_duration_millis = estimate_duration_millis(&source, self.out_channels as u32);
         self.decode_start_millis = 0;
@@ -493,7 +200,7 @@ impl AudioEngine {
         }
         self.visualizer_processor.reset();
     }
-
+ 
     pub fn set_playing(&mut self, playing: bool) {
         if let Ok(mut shared) = self.shared.lock() {
             if playing {
@@ -503,6 +210,10 @@ impl AudioEngine {
         }
     }
 
+    /// Stop the decode thread if it's running. This is called when changing sources 
+    /// or stopping playback.
+    /// 
+    /// It signals the thread to stop and waits for it to finish before returning.
     pub fn stop(&mut self) {
         self.set_playing(false);
         self.stop_decode_thread();
@@ -518,14 +229,6 @@ impl AudioEngine {
         }
     }
 
-    pub fn set_lowpass_hz(&mut self, hz: f32) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.lowpass_hz = hz.max(0.0);
-            shared.recalc_lowpass_alpha();
-            shared.lowpass_prev.fill(0.0);
-        }
-    }
-
     pub fn set_max_queue_seconds(&mut self, seconds: usize) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.set_max_queue_seconds(self.out_channels, seconds);
@@ -537,9 +240,10 @@ impl AudioEngine {
         if self.source_duration_millis > 0 {
             target = target.min(self.source_duration_millis);
         }
-
+ 
         let should_resume = self.is_playing() == 1;
-
+        // Reset state and stop decode thread before updating the decode start time to avoid race conditions 
+        // where the decode thread is still running and checks the old decode_start_millis after we've updated it.
         self.stop_decode_thread();
         self.decode_start_millis = target;
 
@@ -551,12 +255,13 @@ impl AudioEngine {
         if let Ok(mut shared) = self.shared.lock() {
             shared.queue.clear();
             shared.visualizer_ring.clear();
-            shared.lowpass_prev.fill(0.0);
             shared.emitted_samples = 0;
             shared.source_offset_samples = target_samples;
             shared.stream_finished = false;
             shared.playing = false;
         }
+        // Reset the visualizer state to avoid showing a burst of activity 
+        // when seeking to a new position with different audio content.
         self.visualizer_processor.reset();
 
         if should_resume {
@@ -565,6 +270,8 @@ impl AudioEngine {
         }
     }
 
+    /// Get the current playback position in milliseconds. 
+    /// This is calculated based on the number of samples emitted
     pub fn position_millis(&self) -> i32 {
         match self.shared.lock() {
             Ok(shared) => {
@@ -575,18 +282,21 @@ impl AudioEngine {
                 let total_output_samples =
                     shared.source_offset_samples.saturating_add(shared.emitted_samples);
 
-                (total_output_samples as f64
+                ((shared.playback_rate as f64) * (total_output_samples as f64
                     / (shared.sample_rate as f64 * self.out_channels as f64)
-                    * 1000.0) as i32
+                    * 1000.0))  as i32
             }
             Err(_) => -1,
         }
     }
 
+    /// Get the total duration of the loaded audio source in milliseconds.
     pub fn duration_millis(&self) -> i32 {
         self.source_duration_millis
     }
 
+    /// Get maximum queue duration in seconds. 
+    /// This is the maximum amount of audio that will be buffered in memory.
     pub fn max_queue_seconds(&self) -> i32 {
         match self.shared.lock() {
             Ok(shared) => shared.max_queue_seconds as i32,
@@ -594,6 +304,9 @@ impl AudioEngine {
         }
     }
 
+    /// Return size of the buffered audio data in samples. 
+    /// This is the amount of audio data currently buffered and ready for playback.
+    /// This can be used to monitor buffering progress or to implement custom buffering strategies.
     pub fn buffered_samples(&self) -> i32 {
         match self.shared.lock() {
             Ok(shared) => shared.queue.len() as i32,
@@ -601,6 +314,9 @@ impl AudioEngine {
         }
     }
 
+    /// Return size of the buffered audio data in milliseconds.
+    /// Returns -1 if the sample rate or channel count is invalid, 
+    /// which would prevent accurate conversion to milliseconds.
     pub fn buffered_millis(&self) -> i32 {
         match self.shared.lock() {
             Ok(shared) => {
@@ -615,6 +331,7 @@ impl AudioEngine {
         }
     }
 
+    /// Return the number of samples available for the visualizer.  
     pub fn visualizer_available_samples(&self) -> i32 {
         match self.shared.lock() {
             Ok(shared) => shared.visualizer_ring.len() as i32,
@@ -630,6 +347,7 @@ impl AudioEngine {
         self.out_channels as i32
     }
 
+    /// Copy the lasest visualizer samples into the provided buffer.
     pub fn copy_visualizer_samples(&self, out: &mut [f32]) -> i32 {
         match self.shared.lock() {
             Ok(shared) => shared.copy_latest_visualizer_samples(out) as i32,
@@ -637,6 +355,269 @@ impl AudioEngine {
         }
     }
 
+    /// Clear all audio filters. 
+    /// This will reset the audio processing chain to a clean state with no effects applied.
+    pub fn clear_filters(&mut self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            for effect in &mut shared.effects {
+                *effect = Effects::new();
+            }
+        }
+    }
+
+    /// Set the playback rate. This will speed up or slow down the audio without changing the pitch.
+    /// The rate is a multiplier where 1.0 is normal speed, 0.5 is half speed, and 2.0 is double speed.
+    pub fn set_rate(&mut self, rate: f32) {
+        let rate = rate.clamp(MIN_RATE, MAX_RATE);
+
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.playback_rate = rate;
+        }
+    }
+
+    /// Get the current playback rate. This is the multiplier applied to the audio speed, where 1.0 is normal speed.
+    /// Returns -1 if the shared state cannot be accessed, which would prevent retrieving the playback rate.
+    pub fn rate(&self) -> f32 {
+        match self.shared.lock() {
+            Ok(shared) => shared.playback_rate,
+            Err(_) => 1.0,
+        }
+    }
+    
+    /// Set a peaking EQ filter with the specified cutoff frequency, gain, and Q factor.
+    pub fn set_peak_filter(&mut self, cutoff_hz: f32, gain_db: f32, q: f32) {
+        if self.filter_check(cutoff_hz, q) != 0 {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate;
+            for effect in &mut shared.effects {
+                if cutoff_hz > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::PeakingEQ(gain_db),
+                        sample_rate.hz(),
+                        cutoff_hz.hz(),
+                        q,
+                    )
+                    .unwrap();
+                    effect.peak = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.peak = None;
+                }
+            }
+        }
+    }
+
+    /// Set a comb filter with the specified delay and feedback. 
+    /// A comb filter creates a series of notches in the frequency response, which can produce effects like flanging or reverb.
+    pub fn set_comb_filter(&mut self, delay_ms: f32, feedback: f32) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate;
+            for effect in &mut shared.effects {
+                if delay_ms > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::AllPass,
+                        sample_rate.hz(),
+                        (1000.0 / delay_ms).hz(),
+                        feedback,
+                    )
+                    .unwrap();
+                    effect.comb = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.comb = None;
+                }
+            }
+        }
+    }
+
+    /// Check if the provided filter parameters are valid. 
+    /// This is used by the various filter-setting methods to validate the cutoff frequency and Q factor before applying the filter.
+    pub fn filter_check(&self, cutoff_hz: f32, q: f32) -> i8 {
+        let fs = self.shared.lock().unwrap().sample_rate as f32;
+        if cutoff_hz > 0.0 && cutoff_hz < fs / 2.0 && q > 0.0 {
+            info!("Filter params: cutoff={} Hz, Q={}", cutoff_hz, q);
+            0
+        } else if q <= 0.0 {
+            error!("Invalid filter Q: {}. Must be > 0.", q);
+            -1
+        } else if cutoff_hz <= 0.0 {
+            warn!("Disabling filter because cutoff_hz is {}.", cutoff_hz);
+            0
+        } else {
+            error!(
+                "Invalid cutoff frequency: {} Hz. Must be > 0 and < Nyquist ({} Hz).",
+                cutoff_hz,
+                fs / 2.0
+            );
+            -1
+        }
+    }
+
+    /// Set the low-shelf filter parameters. A low-shelf filter boosts or cuts frequencies below the cutoff frequency.
+    pub fn set_low_shelf_filter(&mut self, cutoff_hz: f32, gain_db: f32, q: f32) {
+        if self.filter_check(cutoff_hz, q) != 0 {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate.hz();
+            for effect in &mut shared.effects {
+                if cutoff_hz > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::LowShelf(gain_db),
+                        sample_rate,
+                        cutoff_hz.hz(),
+                        q,
+                    )
+                    .unwrap();
+                    effect.low_shelf = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.low_shelf = None;
+                }
+            }
+        }
+    }
+
+    /// Set the high-shelf filter parameters. A high-shelf filter boosts or cuts frequencies above the cutoff frequency.
+    pub fn set_high_shelf_filter(&mut self, cutoff_hz: f32, gain_db: f32, q: f32) {
+        if self.filter_check(cutoff_hz, q) != 0 {
+            exit(1);
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate.hz();
+            for effect in &mut shared.effects {
+                if cutoff_hz > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::HighShelf(gain_db),
+                        sample_rate,
+                        cutoff_hz.hz(),
+                        q,
+                    )
+                    .unwrap();
+                    effect.high_shelf = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.high_shelf = None;
+                }
+            }
+        }
+    }
+
+    /// Set the band-pass filter parameters. A band-pass filter allows frequencies around the center frequency to pass through while attenuating frequencies outside that range.
+    pub fn set_band_pass_filter(&mut self, center_hz: f32, q: f32) {
+        if self.filter_check(center_hz, q) != 0 {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate.hz();
+            for effect in &mut shared.effects {
+                if center_hz > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::BandPass,
+                        sample_rate,
+                        center_hz.hz(),
+                        q,
+                    )
+                    .unwrap();
+                    effect.band_pass = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.band_pass = None;
+                }
+            }
+        }
+    }
+
+    /// set the low-pass filter parameters. 
+    /// A low-pass filter attenuates frequencies above the cutoff frequency, 
+    /// allowing lower frequencies to pass through.
+    /// 
+    /// If `cutoff_hz` is set to 0 or a negative value, 
+    /// the low-pass filter will be disabled.
+    /// The `q` parameter controls the resonance of the filter. 
+    /// Higher Q values result in a sharper cutoff around the cutoff frequency.
+    /// 
+    /// Returns an error if the parameters are invalid, 
+    /// such as a cutoff frequency above Nyquist or a non-positive Q value.
+    pub fn set_lowpass_filter(&mut self, cutoff_hz: f32, q: f32) {
+        if self.filter_check(cutoff_hz, q) != 0 {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate;
+            for effect in &mut shared.effects {
+                if cutoff_hz > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::LowPass,
+                        sample_rate.hz(),
+                        cutoff_hz.hz(),
+                        q,
+                    )
+                    .unwrap();
+                    effect.low_pass = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.low_pass = None;
+                }
+            }
+        }
+    }
+
+    /// Set the high-pass filter parameters. 
+    /// A high-pass filter attenuates frequencies below the cutoff frequency,
+    /// allowing higher frequencies to pass through.
+    /// 
+    /// If `cutoff_hz` is set to 0 or a negative value,
+    /// the high-pass filter will be disabled.
+    /// The `q` parameter controls the resonance of the filter.
+    /// Higher Q values result in a sharper cutoff around the cutoff frequency.
+    /// Returns an error if the parameters are invalid,
+    /// such as a cutoff frequency above Nyquist or a non-positive Q value.
+    pub fn set_high_pass_filter(&mut self, cutoff_hz: f32, q: f32) {
+        if self.filter_check(cutoff_hz, q) != 0 {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate.hz();
+            for effect in &mut shared.effects {
+                if cutoff_hz > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::HighPass,
+                        sample_rate,
+                        cutoff_hz.hz(),
+                        q,
+                    )
+                    .unwrap();
+                    effect.high_pass = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.high_pass = None;
+                }
+            }
+        }
+    }
+
+    /// Set the notch filter parameters. 
+    /// A notch filter attenuates frequencies around the cutoff frequency, creating a "notch" in the frequency response.
+    pub fn set_notch_filter(&mut self, cutoff_hz: f32, q: f32) {
+        if self.filter_check(cutoff_hz, q) != 0 {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let sample_rate = shared.sample_rate.hz();
+            for effect in &mut shared.effects {
+                if cutoff_hz > 0.0 {
+                    let coeffs = Coefficients::<f32>::from_params(
+                        biquad::Type::Notch,
+                        sample_rate,
+                        cutoff_hz.hz(),
+                        q,
+                    )
+                    .unwrap();
+                    effect.notch = Some(DirectForm1::new(coeffs));
+                } else {
+                    effect.notch = None;
+                }
+            }
+        }
+    }
+
+    /// Copy the latest visualizer spectrum data into the provided buffer.
     pub fn copy_visualizer_spectrum(&mut self, out: &mut [f32]) -> i32 {
         let (snapshot, playing) = match self.shared.lock() {
             Ok(shared) => (shared.visualizer_ring.iter().copied().collect::<Vec<f32>>(), shared.playing),
@@ -647,6 +628,9 @@ impl AudioEngine {
             .compute(&snapshot, self.out_channels, self.out_sample_rate, out, playing)
     }
 
+    /// Check if the player is currently playing. 
+    /// Returns 1 if playing, 0 if paused or stopped, and -1 if the state cannot be determined.
+    /// This can be used to update UI elements or to implement custom playback logic based on the current state.
     pub fn is_playing(&self) -> i32 {
         match self.shared.lock() {
             Ok(shared) => i32::from(shared.playing),
@@ -654,6 +638,9 @@ impl AudioEngine {
         }
     }
 
+    /// Get the current player state as an enum. 
+    /// This provides more detailed information about the playback state, 
+    /// including whether it's idle, playing, paused, or stopped.
     pub fn get_state(&self) -> PlayerState {
         if self.source.is_none() {
             return PlayerState::Idle;
@@ -675,7 +662,9 @@ impl AudioEngine {
     pub fn is_source_loaded(&self) -> i32 {
         i32::from(self.source.is_some())
     }
-
+    
+    /// Start the decode thread if it's not already running. 
+    /// This thread is responsible for decoding the audio source and feeding it into the playback queue.
     pub fn start_decode_thread_if_needed(&mut self) -> Result<(), String> {
         if self.decode_thread.is_some() {
             return Ok(());
@@ -789,6 +778,7 @@ impl AudioEngine {
 
         Ok(serde_json::to_string(&metadata).map_err(|_| "Failed to serialize metadata")?)
     }
+
     /// Extracts the first visual thumbnail from the media file, if available. 
     /// Returns the raw image data as a byte vector, or an empty vector if no thumbnail is found.
     pub fn get_thumbnail(&self, path: &str) -> Result<Vec<u8>, String> {
@@ -856,121 +846,11 @@ fn write_bytes_to_temp_file(bytes: &[u8], tag: &str) -> Result<File, String> {
         .map_err(|e| format!("Failed to open temporary media file '{}': {e}", path.display()))
 }
 
-use std::io::{Read, Seek, SeekFrom};
-use reqwest::blocking::Client;
 
-use crate::player_state::PlayerState;
 
-struct HttpStream {
-    url: reqwest::Url,
-    client: Client,
-    response: Option<reqwest::blocking::Response>,
-    pos: u64,
-    len: Option<u64>,
-}
 
-impl HttpStream {
-    fn new(url_str: &str) -> Result<Self, String> {
-        let client = Client::new();
-        let url = reqwest::Url::parse(url_str).map_err(|e| format!("Invalid URL: {e}"))?;
-
-        let head_res = client.head(url.clone()).send()
-            .map_err(|e| format!("Failed to send HEAD request: {e}"))?;
-
-        let len = head_res.headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|val| val.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-
-        Ok(Self {
-            url,
-            client,
-            response: None,
-            pos: 0,
-            len,
-        })
-    }
-
-    fn send_range_request(&mut self, start: u64) -> Result<(), std::io::Error> {
-        let range = format!("bytes={}-", start);
-        let res = self.client.get(self.url.clone())
-            .header(reqwest::header::RANGE, range)
-            .send()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-            .error_for_status()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        
-        self.response = Some(res);
-        self.pos = start;
-        Ok(())
-    }
-}
-
-impl Read for HttpStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.response.is_none() {
-            self.send_range_request(self.pos)?;
-        }
-
-        match self.response.as_mut() {
-            Some(res) => {
-                let bytes_read = res.read(buf)?;
-                if bytes_read == 0 {
-                    // End of stream
-                    self.response = None;
-                } else {
-                    self.pos += bytes_read as u64;
-                }
-                Ok(bytes_read)
-            }
-            None => Ok(0),
-        }
-    }
-}
-
-impl Seek for HttpStream {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(p) => p,
-            SeekFrom::End(p) => {
-                if let Some(len) = self.len {
-                    len.checked_add_signed(p).ok_or_else(|| {
-                      std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek underflow")
-                    })?
-                } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "Seek from end not supported without content length",
-                    ));
-                }
-            }
-             SeekFrom::Current(p) => self.pos.checked_add_signed(p).ok_or_else(|| {
-               std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek underflow")
-          })?,
-        };
-
-        if new_pos > self.len.unwrap_or(u64::MAX) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Seek beyond end of stream",
-            ));
-        }
-
-        self.send_range_request(new_pos)?;
-        Ok(new_pos)
-    }
-}
-
-impl MediaSource for HttpStream {
-    fn is_seekable(&self) -> bool {
-        self.len.is_some()
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        self.len
-    }
-}
-
+/// Creates a MediaSource from the given AudioSource, 
+/// which can be a file path, URL, or in-memory data. 
 fn media_source_from_owned(source: AudioSource) -> Result<BoxedMediaSource, String> {
     match source {
         AudioSource::Path(path) => {
@@ -992,6 +872,7 @@ fn media_source_from_owned(source: AudioSource) -> Result<BoxedMediaSource, Stri
     }
 }
 
+/// Similar to media_source_from_owned but takes a reference to avoid cloning large in-memory data.
 fn media_source_from_ref(source: &AudioSource) -> Result<BoxedMediaSource, String> {
     match source {
         AudioSource::Path(path) => {
@@ -1083,12 +964,20 @@ fn decode_and_feed(
             break Ok(());
         }
 
+        let playback_rate = match shared.lock() {
+            Ok(s) => s.playback_rate.clamp(MIN_RATE, MAX_RATE),
+            Err(_) => 1.0,
+        };
+
+        // Change effective source->output conversion ratio to implement playback speed.
+        let effective_out_rate = ((out_sample_rate as f32) / playback_rate).max(1.0) as u32;
+
         let out = convert_to_output(
             &interleaved,
             src_channels,
             src_rate,
             out_channels,
-            out_sample_rate,
+            effective_out_rate,
             &mut resample_state,
         );
 
@@ -1163,7 +1052,7 @@ fn estimate_duration_millis(source: &AudioSource, _out_channels: u32) -> i32 {
     ) {
         Ok(p) => p,
         Err(err) => {
-            error!("Failed to probe source for duration: {err}");
+            error!("Failed to probe source for duration: {}", err);
             return -1;
         }
     };
@@ -1220,6 +1109,8 @@ fn source_frame_sample(
     frames[base + idx]
 }
 
+/// Resamples and remaps the source frames to match the output configuration, 
+/// using linear interpolation.
 fn convert_to_output(
     src_interleaved: &[f32],
     src_channels: usize,
@@ -1275,6 +1166,7 @@ fn convert_to_output(
     out
 }
 
+/// Writes the next audio samples to the output buffer, applying volume and handling synchronization.
 fn write_output_f32(data: &mut [f32], channels: usize, shared: &Arc<Mutex<SharedPlayback>>) {
     let mut guard = match shared.lock() {
         Ok(g) => g,
@@ -1285,12 +1177,13 @@ fn write_output_f32(data: &mut [f32], channels: usize, shared: &Arc<Mutex<Shared
     };
 
     for frame in data.chunks_mut(channels) {
-        for (ch, out) in frame.iter_mut().enumerate() {
-            *out = guard.next_sample(ch);
+        for (_, out) in frame.iter_mut().enumerate() {
+            *out = guard.next_sample();
         }
     }
 }
 
+/// Similar to write_output_f32 but converts the samples to i16 format, scaling appropriately.
 fn write_output_i16(data: &mut [i16], channels: usize, shared: &Arc<Mutex<SharedPlayback>>) {
     let mut guard = match shared.lock() {
         Ok(g) => g,
@@ -1301,13 +1194,14 @@ fn write_output_i16(data: &mut [i16], channels: usize, shared: &Arc<Mutex<Shared
     };
 
     for frame in data.chunks_mut(channels) {
-        for (ch, out) in frame.iter_mut().enumerate() {
-            let sample = guard.next_sample(ch);
+        for (_, out) in frame.iter_mut().enumerate() {
+            let sample = guard.next_sample();
             *out = (sample * i16::MAX as f32) as i16;
         }
     }
 }
 
+/// Similar to write_output_f32 but converts the samples to u16 format, scaling and offsetting to fit the unsigned range.
 fn write_output_u16(data: &mut [u16], channels: usize, shared: &Arc<Mutex<SharedPlayback>>) {
     let mut guard = match shared.lock() {
         Ok(g) => g,
@@ -1318,8 +1212,8 @@ fn write_output_u16(data: &mut [u16], channels: usize, shared: &Arc<Mutex<Shared
     };
 
     for frame in data.chunks_mut(channels) {
-        for (ch, out) in frame.iter_mut().enumerate() {
-            let sample = guard.next_sample(ch);
+        for (_, out) in frame.iter_mut().enumerate() {
+            let sample = guard.next_sample();
             *out = (((sample * 0.5) + 0.5) * u16::MAX as f32) as u16;
         }
     }
@@ -1355,22 +1249,4 @@ pub fn output_device_count() -> i32 {
         Ok(devices) => devices.count() as i32,
         Err(_) => -1,
     }
-}
-
-fn hann_window(index: usize, len: usize) -> f32 {
-    if len <= 1 {
-        return 1.0;
-    }
-    let x = index as f32 / (len - 1) as f32;
-    (0.5 - 0.5 * (2.0 * std::f32::consts::PI * x).cos()).clamp(0.0, 1.0)
-}
-
-fn log_interp(min: f32, max: f32, t: f32) -> f32 {
-    min * (max / min).powf(t.clamp(0.0, 1.0))
-}
-
-fn hz_to_bin(freq: f32, sample_rate: u32, fft_size: usize) -> usize {
-    let nyquist = sample_rate as f32 / 2.0;
-    let clamped = freq.clamp(0.0, nyquist);
-    ((clamped / sample_rate as f32) * fft_size as f32) as usize
 }

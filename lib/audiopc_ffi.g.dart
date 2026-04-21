@@ -108,3 +108,65 @@ external int audiopc_get_thumbnail(
 
 @ffi.Native<ffi.Int32 Function()>()
 external int audiopc_get_player_state();
+
+@ffi.Native<ffi.Int32 Function(ffi.Float)>()
+external int audiopc_set_rate(double rate);
+
+@ffi.Native<ffi.Int32 Function(ffi.Float, ffi.Float)>()
+external int audiopc_set_comb_filter(double delay_ms, double feedback);
+
+@ffi.Native<ffi.Int32 Function(ffi.Float, ffi.Float, ffi.Float)>()
+external int audiopc_set_peak_filter(
+  double center_hz,
+  double gain_db,
+  double q,
+);
+
+@ffi.Native<ffi.Int32 Function(ffi.Float, ffi.Float, ffi.Float)>()
+external int audiopc_set_low_shelf_filter(
+  double cutoff_hz,
+  double gain_db,
+  double q,
+);
+
+@ffi.Native<ffi.Int32 Function(ffi.Float, ffi.Float, ffi.Float)>()
+external int audiopc_set_high_shelf_filter(
+  double cutoff_hz,
+  double gain_db,
+  double q,
+);
+
+@ffi.Native<ffi.Int32 Function(ffi.Float, ffi.Float)>()
+external int audiopc_set_band_pass_filter(double center_hz, double q);
+
+@ffi.Native<ffi.Int32 Function(ffi.Float, ffi.Float)>()
+external int audiopc_set_notch_filter(double center_hz, double q);
+
+@ffi.Native<ffi.Int32 Function(ffi.Float, ffi.Float)>()
+external int audiopc_set_high_pass_filter(double cutoff_hz, double q);
+
+@ffi.Native<ffi.Int32 Function()>()
+external int audiopc_clear_filters();
+
+@ffi.Native<ffi.Float Function()>()
+external double audiopc_get_rate();
+
+const int DEFAULT_MAX_QUEUE_SECONDS = 20;
+
+const int MIN_MAX_QUEUE_SECONDS = 1;
+
+const int MAX_MAX_QUEUE_SECONDS = 120;
+
+const int DECODE_BACKPRESSURE_SLEEP_MS = 2;
+
+const int DEFAULT_VISUALIZER_SECONDS = 2;
+
+const int VISUALIZER_FFT_SIZE = 2048;
+
+const int DEFAULT_VISUALIZER_BAR_COUNT = 64;
+
+const double VISUALIZER_MIN_HZ = 35.0;
+
+const double MIN_RATE = 0.5;
+
+const double MAX_RATE = 2.0;

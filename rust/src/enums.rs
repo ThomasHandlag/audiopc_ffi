@@ -1,0 +1,10 @@
+pub const DEFAULT_MAX_QUEUE_SECONDS: usize = 20;
+pub const MIN_MAX_QUEUE_SECONDS: usize = 1;
+pub const MAX_MAX_QUEUE_SECONDS: usize = 120;
+pub const DECODE_BACKPRESSURE_SLEEP_MS: u64 = 2;
+pub const DEFAULT_VISUALIZER_SECONDS: usize = 2;
+pub const VISUALIZER_FFT_SIZE: usize = 2048;
+pub const DEFAULT_VISUALIZER_BAR_COUNT: usize = 64;
+pub const VISUALIZER_MIN_HZ: f32 = 35.0;
+pub const MIN_RATE: f32 = 0.5;
+pub const MAX_RATE: f32 = 2.0;

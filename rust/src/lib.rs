@@ -3,6 +3,12 @@
 mod engine;
 mod ffi;
 mod player_state;
+mod effects;
+mod enums;
+mod processor;
+mod source;
+mod http_stream;
+mod log;
 
 #[cfg(target_os = "android")]
 mod android_init {
