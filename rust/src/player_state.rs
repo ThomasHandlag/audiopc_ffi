@@ -1,190 +1,180 @@
 use std::collections::VecDeque;
+use std::time::Duration;
 
-use crate::{effects::Effects, enums::{DEFAULT_MAX_QUEUE_SECONDS, DEFAULT_VISUALIZER_SECONDS, MAX_MAX_QUEUE_SECONDS, MIN_MAX_QUEUE_SECONDS}};
+use crate::effects::Effects;
+use crate::enums::{
+    DEFAULT_MAX_QUEUE_SECONDS, DEFAULT_VISUALIZER_SECONDS, MAX_MAX_QUEUE_SECONDS,
+    MIN_MAX_QUEUE_SECONDS,
+};
+use crate::error::AudioError;
 
-/// The `PlayerState` enum is used to represent the current state of the player, 
-/// such as whether it is idle, playing, paused, or stopped. 
-/// This can be useful for updating UI elements or implementing custom playback logic based on the current state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlayerState {
-  Idle,
-  Playing,
-  Paused,
-  Stopped,
+// ── PlaybackStatus ────────────────────────────────────────────────────────────
+
+/// Full playback state with more detail than a simple boolean.
+///
+/// Matches the architecture spec's `PlaybackStatus` enum.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaybackStatus {
+    /// No source is loaded; the engine is doing nothing.
+    Idle,
+    /// Audio is actively playing.
+    Playing,
+    /// Playback is paused — position is preserved.
+    Paused,
+    /// Waiting for the network / decode buffer to fill.
+    Buffering,
+    /// The source reached its end naturally.
+    Finished,
+    /// An error caused playback to stop.
+    Error(AudioError),
 }
 
-/// ResampleState holds the state for resampling audio when the playback rate is changed.
-/// It includes the current position in the resampling process and any carry-over samples 
-/// that need to be processed in the next callback.
-/// This allows for smooth time-stretching of the audio when the playback rate is adjusted, 
-/// ensuring that the output remains consistent and free of artifacts.
+/// Simplified `PlayerState` kept for the public FFI layer (maps to i32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerState {
+    Idle,
+    Playing,
+    Paused,
+    Stopped,
+}
+
+impl From<&PlaybackStatus> for PlayerState {
+    fn from(status: &PlaybackStatus) -> Self {
+        match status {
+            PlaybackStatus::Idle | PlaybackStatus::Buffering => PlayerState::Idle,
+            PlaybackStatus::Playing => PlayerState::Playing,
+            PlaybackStatus::Paused => PlayerState::Paused,
+            PlaybackStatus::Finished | PlaybackStatus::Error(_) => PlayerState::Stopped,
+        }
+    }
+}
+
+// ── ResampleState ─────────────────────────────────────────────────────────────
+
+/// Carries fractional position and boundary samples across decode packets.
+///
+/// Linear interpolation is used to convert between the source sample rate and
+/// the device's native rate (and playback speed).  This state prevents audible
+/// glitches at packet boundaries.
 pub struct ResampleState {
-   pub pos: f64,
-   pub carry: Vec<f32>,
+    /// Current fractional position within the current packet (source frames).
+    pub pos: f64,
+    /// The last *source* frame of the previous packet, used as the left
+    /// neighbour for the first interpolated output sample of the next packet.
+    pub carry: Vec<f32>,
 }
 
 impl ResampleState {
-   pub fn new() -> Self {
-        Self {
-            pos: 0.0,
-            carry: Vec::new(),
-        }
+    pub fn new() -> Self {
+        Self { pos: 0.0, carry: Vec::new() }
+    }
+
+    pub fn reset(&mut self) {
+        self.pos = 0.0;
+        self.carry.clear();
     }
 }
 
-/// The shared playback state that is accessed by both the audio callback and the decode thread.
-/// This struct contains the main audio sample queue, the visualizer ring buffer, and various playback parameters. 
-/// It is protected by a mutex to ensure thread safety when accessed from multiple threads.
+impl Default for ResampleState {
+    fn default() -> Self { Self::new() }
+}
+
+// ── SharedPlayback ────────────────────────────────────────────────────────────
+
+/// State that is **shared** between the audio-callback thread and any thread
+/// that drives the engine (decode thread, FFI calls, event loop).
+///
+/// All fields are accessed under a `Mutex` owned by `AudioEngine`.  The lock
+/// is held only for the shortest possible time to avoid priority inversion.
 pub struct SharedPlayback {
-   /// The main audio sample queue that feeds the output. 
-   /// This queue is filled by the decode thread and consumed by the audio callback.
-   pub queue: VecDeque<f32>,
+    // ── Sample queues ─────────────────────────────────────────────────────
+    /// Ready-to-play interleaved `f32` samples fed by the decode thread and
+    /// consumed by the cpal callback.
+    pub queue: VecDeque<f32>,
 
-   /// A ring buffer that holds the most recent samples for visualizer purposes. 
-   /// This allows the visualizer to access a snapshot of the latest audio data without interfering with the main playback queue.
-   pub visualizer_ring: VecDeque<f32>,
+    /// Recent samples kept for visualiser use.  Written by the cpal callback
+    /// after applying volume; read by the visualiser on the UI thread.
+    pub visualizer_ring: VecDeque<f32>,
 
-   /// The maximum number of samples to keep in the visualizer ring buffer. 
-   /// This is calculated based on the sample rate, number of channels, and a configurable duration (e.g., 5 seconds).
-   pub visualizer_max_samples: usize,
+    // ── Queue sizing ──────────────────────────────────────────────────────
+    pub max_samples:          usize,
+    pub max_queue_seconds:    usize,
+    pub visualizer_max_samples: usize,
 
-   /// The maximum number of samples to keep in the main playback queue. 
-   /// This is calculated based on the sample rate, number of channels, and a configurable duration (e.g., 30 seconds).
-   pub max_samples: usize,
+    // ── Playback parameters ───────────────────────────────────────────────
+    /// Current playback rate.  1.0 = normal speed.
+    pub playback_rate: f32,
 
-   /// The maximum number of seconds worth of audio to keep in the main playback queue. 
-   /// This is a user-configurable setting that determines how much audio data can be buffered for playback.
-   pub max_queue_seconds: usize,
+    /// Master volume: 0.0 = silence, 1.0 = unity.
+    pub volume: f32,
 
-   /// The current playback rate. A value of 1.0 means normal speed, 0.5 means half speed, and 2.0 means double speed. 
-   /// This can be used to implement features like slow motion or fast forward.
-   /// Note that changing the playback rate may affect the pitch of the audio unless time-stretching algorithms are used.
-   pub playback_rate: f32,
+    // ── Playback state flags ──────────────────────────────────────────────
+    /// The engine is actively consuming from `queue`.
+    pub playing: bool,
+    /// The decode thread has written all packets; no more data is coming.
+    pub stream_finished: bool,
 
-   /// Indicates whether the player is currently playing.
-   pub playing: bool,
+    // ── Position tracking ─────────────────────────────────────────────────
+    /// Total interleaved samples consumed by the cpal callback since
+    /// the last seek.  Used to compute `position_millis`.
+    pub emitted_samples: u64,
 
-   /// Indicates whether the audio stream has finished playing. 
-   /// This is set to true when the end of the audio source is reached, 
-   /// allowing the player to stop playback and reset the state as needed.
-   pub stream_finished: bool,
+    /// Absolute source position in interleaved output samples.
+    ///
+    /// Advanced by `playback_rate` per emitted sample so that live rate
+    /// changes are reflected in the position without re-scaling past time.
+    pub source_position_samples: f64,
 
-   /// The current volume level, where 1.0 is the original volume, 0.5 is half volume, and 2.0 is double volume. 
-   /// This can be used to implement volume control features in the player.
-   pub volume: f32,
+    /// Sample rate of the output device (Hz).
+    pub sample_rate: u32,
 
-   /// The total number of audio samples that have been emitted to the output. 
-   /// This is used to track the playback position and can be useful for features like seeking or displaying the current time in the UI.
-   /// Note that this count is based on the number of samples sent to the output, not the number of samples decoded or processed.
-   /// It is incremented in the audio callback each time a sample is output, and it can be used to calculate the current playback time by dividing by the sample rate.
-   pub emitted_samples: u64,
+    // ── Per-channel DSP ───────────────────────────────────────────────────
+    /// One `Effects` chain per output channel.  Indexed by
+    /// `emitted_samples % effects.len()`.
+    pub effects: Vec<Effects>,
 
-   /// The offset in samples from the start of the audio source. 
-   /// This is used to track the current position in the audio source, especially when seeking or when starting playback from a specific point.
-   /// When a new audio source is loaded, this offset is reset to zero. As playback progresses, this offset is updated based on the number of samples emitted and any seeking actions taken by the user.
-   /// This allows the player to maintain an accurate position within the audio source, which is essential for features like seeking, displaying the current time, and synchronizing with visualizers or other components.
-   /// Note that this offset is separate from the emitted_samples count, as it represents the position within the source rather than the total number of samples output. It is used in conjunction with the emitted_samples to calculate the current playback position and to manage seeking and other position-related features.
-   pub source_offset_samples: u64,
+    // ── Detailed status ───────────────────────────────────────────────────
+    /// Fine-grained playback status used for event emission.
+    pub status: PlaybackStatus,
 
-   /// The sample rate of the audio being played. This is used to calculate timing and to manage the playback queue and visualizer buffers. 
-   /// The sample rate is typically determined by the audio source and the output device, and it can affect the quality and performance of the audio playback. 
-   /// Common sample rates include 44100 Hz (CD quality), 48000 Hz (DVD quality), and 96000 Hz (high-resolution audio).
-   /// The sample rate is used in various calculations throughout the player, such as determining how many samples correspond to a certain duration of time, managing the visualizer buffer size, and ensuring that the audio is processed correctly for the output device. It is an essential parameter for accurate audio playback and synchronization with visualizers and other components.
-   pub sample_rate: u32,
-
-   /// A vector of effects processors, one for each output channel. 
-   /// These processors can apply various audio effects (e.g., reverb, delay, distortion) to the output samples before they are sent to the audio output. 
-   /// Each effect processor can be configured independently, allowing for different effects on different channels if desired
-   pub effects: Vec<Effects>,
+    // ── Underrun counter ──────────────────────────────────────────────────
+    /// Cumulative buffer-underrun count since last reset.
+    pub underrun_count: u32,
 }
 
 impl SharedPlayback {
+    /// Construct with device-native sample rate and channel count.
     pub fn new(channels: usize, sample_rate: u32) -> Self {
-        let max_samples = sample_rate
-            .saturating_mul(channels as u32)
-            .saturating_mul(DEFAULT_MAX_QUEUE_SECONDS as u32) as usize;
-        let visualizer_max_samples = sample_rate
-            .saturating_mul(channels as u32)
-            .saturating_mul(DEFAULT_VISUALIZER_SECONDS as u32) as usize;
+        let max_samples = (sample_rate as usize)
+            .saturating_mul(channels)
+            .saturating_mul(DEFAULT_MAX_QUEUE_SECONDS);
+        let visualizer_max_samples = (sample_rate as usize)
+            .saturating_mul(channels)
+            .saturating_mul(DEFAULT_VISUALIZER_SECONDS);
+
         Self {
-            queue: VecDeque::with_capacity(max_samples),
-            visualizer_ring: VecDeque::with_capacity(visualizer_max_samples),
+            queue:                   VecDeque::with_capacity(max_samples),
+            visualizer_ring:         VecDeque::with_capacity(visualizer_max_samples),
             visualizer_max_samples,
             max_samples,
-            max_queue_seconds: DEFAULT_MAX_QUEUE_SECONDS,
-            playback_rate: 1.0,
-            playing: false,
-            stream_finished: true,
-            volume: 1.0,
-            emitted_samples: 0,
-            source_offset_samples: 0,
+            max_queue_seconds:       DEFAULT_MAX_QUEUE_SECONDS,
+            playback_rate:           1.0,
+            volume:                  1.0,
+            playing:                 false,
+            stream_finished:         true,
+            emitted_samples:         0,
+            source_position_samples: 0.0,
             sample_rate,
-            effects: (0..channels).map(|_| Effects::new()).collect(),
+            effects:                 (0..channels.max(1)).map(|_| Effects::new()).collect(),
+            status:                  PlaybackStatus::Idle,
+            underrun_count:          0,
         }
     }
 
-    pub fn clear_audio_state(&mut self) {
-        self.queue.clear();
-        self.visualizer_ring.clear();
-        self.emitted_samples = 0;
-        self.source_offset_samples = 0;
-        self.stream_finished = true;
-        for effect in &mut self.effects {
-            *effect = Effects::new();
-        }
-    }
+    // ── Queue helpers ─────────────────────────────────────────────────────
 
-    pub fn push_visualizer_sample(&mut self, sample: f32) {
-        if self.visualizer_max_samples == 0 {
-            return;
-        }
-
-        if self.visualizer_ring.len() >= self.visualizer_max_samples {
-            let _ = self.visualizer_ring.pop_front();
-        }
-
-        self.visualizer_ring.push_back(sample);
-    }
-
-    pub fn copy_latest_visualizer_samples(&self, out: &mut [f32]) -> usize {
-        if out.is_empty() || self.visualizer_ring.is_empty() {
-            return 0;
-        }
-
-        let count = out.len().min(self.visualizer_ring.len());
-        let skip = self.visualizer_ring.len().saturating_sub(count);
-
-        for (index, sample) in self
-            .visualizer_ring
-            .iter()
-            .skip(skip)
-            .take(count)
-            .enumerate()
-        {
-            out[index] = *sample;
-        }
-
-        count
-    }
-
-    pub fn set_max_queue_seconds(&mut self, channels: usize, seconds: usize) {
-        let bounded = seconds.clamp(MIN_MAX_QUEUE_SECONDS, MAX_MAX_QUEUE_SECONDS);
-        self.max_queue_seconds = bounded;
-        self.max_samples = self
-            .sample_rate
-            .saturating_mul(channels as u32)
-            .saturating_mul(bounded as u32) as usize;
-
-        while self.queue.len() > self.max_samples {
-            let _ = self.queue.pop_front();
-        }
-
-        if self.queue.capacity() < self.max_samples {
-            self.queue
-                .reserve(self.max_samples.saturating_sub(self.queue.capacity()));
-        }
-    }
-
+    /// Push up to `max_samples - queue.len()` samples.  Returns the count
+    /// actually pushed; caller retries the rest after sleeping.
     pub fn push_samples_bounded(&mut self, samples: &[f32]) -> usize {
         let available = self.max_samples.saturating_sub(self.queue.len());
         let push_count = samples.len().min(available);
@@ -192,29 +182,122 @@ impl SharedPlayback {
         push_count
     }
 
+    /// Resize the queue cap.  Excess samples are dropped from the front.
+    pub fn set_max_queue_seconds(&mut self, channels: usize, seconds: usize) {
+        let bounded = seconds.clamp(MIN_MAX_QUEUE_SECONDS, MAX_MAX_QUEUE_SECONDS);
+        self.max_queue_seconds = bounded;
+        self.max_samples = (self.sample_rate as usize)
+            .saturating_mul(channels)
+            .saturating_mul(bounded);
+        while self.queue.len() > self.max_samples {
+            self.queue.pop_front();
+        }
+        if self.queue.capacity() < self.max_samples {
+            self.queue.reserve(self.max_samples.saturating_sub(self.queue.capacity()));
+        }
+    }
+
+    // ── Visualiser helpers ────────────────────────────────────────────────
+
+    pub fn push_visualizer_sample(&mut self, sample: f32) {
+        if self.visualizer_max_samples == 0 {
+            return;
+        }
+        if self.visualizer_ring.len() >= self.visualizer_max_samples {
+            self.visualizer_ring.pop_front();
+        }
+        self.visualizer_ring.push_back(sample);
+    }
+
+    /// Copy the most recent `out.len()` samples from the visualiser ring into
+    /// `out`.  Returns the number of samples written.
+    pub fn copy_latest_visualizer_samples(&self, out: &mut [f32]) -> usize {
+        if out.is_empty() || self.visualizer_ring.is_empty() {
+            return 0;
+        }
+        let count = out.len().min(self.visualizer_ring.len());
+        let skip  = self.visualizer_ring.len().saturating_sub(count);
+        for (i, s) in self.visualizer_ring.iter().skip(skip).take(count).enumerate() {
+            out[i] = *s;
+        }
+        count
+    }
+
+    // ── State reset ───────────────────────────────────────────────────────
+
+    /// Clear all transient audio state without touching volume / rate / device.
+    pub fn clear_audio_state(&mut self) {
+        self.queue.clear();
+        self.visualizer_ring.clear();
+        self.emitted_samples         = 0;
+        self.source_position_samples = 0.0;
+        self.stream_finished         = true;
+        self.underrun_count          = 0;
+        for e in &mut self.effects {
+            *e = Effects::new();
+        }
+    }
+
+    // ── Hot-path sample output ────────────────────────────────────────────
+
+    /// Called by the cpal callback for every output sample.
+    ///
+    /// Returns 0.0 (silence) if paused, buffering, or the queue is empty.  
+    /// Applies per-channel effects and volume, then records the sample in the
+    /// visualiser ring.
+    #[inline]
     pub fn next_sample(&mut self) -> f32 {
         if !self.playing {
             return 0.0;
         }
 
-        let raw = if let Some(sample) = self.queue.pop_front() {
-            self.emitted_samples = self.emitted_samples.saturating_add(1);
-            sample
-        } else {
-            if self.stream_finished {
-                self.playing = false;
+        let channel_count = self.effects.len().max(1);
+        let channel_index = (self.emitted_samples as usize) % channel_count;
+
+        let raw = match self.queue.pop_front() {
+            Some(s) => {
+                self.emitted_samples = self.emitted_samples.saturating_add(1);
+                self.source_position_samples += self.playback_rate as f64;
+                s
             }
-            return 0.0;
+            None => {
+                if self.stream_finished {
+                    self.playing = false;
+                    self.status  = PlaybackStatus::Finished;
+                } else {
+                    // Queue empty but stream not done → underrun.
+                    self.underrun_count = self.underrun_count.saturating_add(1);
+                }
+                return 0.0;
+            }
         };
 
         let mut sample = raw * self.volume;
 
-        for effect in &mut self.effects {
-            sample = effect.process(sample);
+        // Apply per-channel DSP chain.
+        if let Some(effect) = self.effects.get_mut(channel_index) {
+            sample = effect.process(sample, channel_index);
         }
 
         let sample = sample.clamp(-1.0, 1.0);
         self.push_visualizer_sample(sample);
         sample
+    }
+
+    // ── Position helpers ──────────────────────────────────────────────────
+
+    /// Current playback position as a `Duration`.
+    pub fn position(&self, out_channels: usize) -> Duration {
+        if self.sample_rate == 0 || out_channels == 0 {
+            return Duration::ZERO;
+        }
+        let secs = self.source_position_samples
+            / (self.sample_rate as f64 * out_channels as f64);
+        Duration::from_secs_f64(secs.max(0.0))
+    }
+
+    /// Current playback position in milliseconds (for the FFI layer).
+    pub fn position_millis(&self, out_channels: usize) -> i32 {
+        self.position(out_channels).as_millis() as i32
     }
 }

@@ -10,9 +10,8 @@ pub const RESET_COLOR: &str = "\x1b[0m";
 #[macro_export]
 macro_rules! error {
     () => {
-        print("\n");
-    };
-    ($($arg:tt)*) => {
+        eprintln!();
+    };    ($($arg:tt)*) => {
         eprintln!("{}[ERROR] {}{}", $crate::log::ERROR_COLOR, format!($($arg)*), $crate::log::RESET_COLOR);
     };   
 }

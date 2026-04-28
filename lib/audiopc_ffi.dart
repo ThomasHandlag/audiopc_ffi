@@ -84,36 +84,42 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
 
   /// Seeks to a playback position in milliseconds.
   @override
-  void seek(int positionMillis) => bindings.audiopc_seek_millis(positionMillis);
+  bool seek(int positionMillis) {
+    final ok = _ok(bindings.audiopc_seek_millis(positionMillis));
+    if (ok) {
+      positionController.add(positionMillis);
+    }
+    return ok;
+  }
 
   /// Starts or resumes playback.
   @override
   bool play() {
-    final isOk = _ok(bindings.audiopc_play());
-    if (isOk) {
+    final ok = _ok(bindings.audiopc_play());
+    if (ok) {
       setState(PlayerState.playing);
     }
-    return isOk;
+    return ok;
   }
 
   /// Pauses active playback.
   @override
   bool pause() {
-    final isOk = _ok(bindings.audiopc_pause());
-    if (isOk) {
+    final ok = _ok(bindings.audiopc_pause());
+    if (ok) {
       setState(PlayerState.paused);
     }
-    return isOk;
+    return ok;
   }
 
   /// Stops playback and resets to the idle state.
   @override
   bool stop() {
-    final isOk = _ok(bindings.audiopc_stop());
-    if (isOk) {
+    final ok = _ok(bindings.audiopc_stop());
+    if (ok) {
       setState(PlayerState.stopped);
     }
-    return isOk;
+    return ok;
   }
 
   /// Convenience method to play a source directly from a URL or file path.
@@ -127,9 +133,12 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   }
 
   /// Convenience method to play directly from an in-memory byte buffer.
-  void playMemory(Uint8List data) {
-    setMemorySource(data);
-    play();
+  bool playMemory(Uint8List data) {
+    final ok = setMemorySource(data);
+    if (ok) {
+      play();
+    }
+    return ok;
   }
 
   /// Sets output gain where 1.0 is the nominal level.
@@ -138,7 +147,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
 
   /// Sets low-pass cutoff in Hz. Use 0 to disable filtering.
   @override
-  bool setLowPassHz(double hz) => _ok(bindings.audiopc_set_lowpass_hz(hz));
+  bool setLowPassHz(double hz) => _ok(bindings.audiopc_set_lowpass_hz(hz, 10));
 
   /// Number of decoded samples waiting in the native buffer.
   @override
@@ -363,29 +372,11 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
     return _ok(code);
   }
 
-  /// Sets a comb filter with a specified delay in milliseconds, feedback level, and damping factor.
-  ///
-  /// The `delayMs` parameter specifies the delay time of the comb filter in milliseconds,
-  /// which determines the spacing of the notches in the frequency response.
-  ///
-  /// The `feedback` parameter controls the amount of the delayed signal that is fed back into the input,
-  /// where a value of 0 means no feedback and values closer to 1 result in a more pronounced comb filtering effect.
-  ///
-  /// The `damp` parameter controls the damping of the comb filter,
-  /// which affects the decay of the notches in the frequency response.
-  bool setCombFilter(double delayMs, double feedback, double damp) {
-    final code = bindings.audiopc_set_comb_filter(delayMs, feedback);
-    return _ok(code);
-  }
-
-  /// T-notch filter or band-rejection filter is a filter that passes most frequencies unaltered,
+  /// A notch filter (band-rejection filter) passes most frequencies unaltered,
   /// but attenuates those in a specific range to very low levels.
   ///
   /// The `centerHz` parameter specifies the center frequency of the notch in Hz,
-  /// while `bandwidthHz` defines the width of the notch in Hz.
-  ///
-  /// The `gainDb` parameter allows for adjusting the depth of the notch,
-  /// where a more negative value results in a deeper notch.
+  /// and `q` controls the quality factor (bandwidth) of the notch.
   bool setNotchFilter(double centerHz, double q) {
     final code = bindings.audiopc_set_notch_filter(centerHz, q);
 

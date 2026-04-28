@@ -106,6 +106,7 @@ dependencies = [
  "rustfft",
  "serde_json",
  "symphonia",
+ "tempfile",
 ]
 
 [[package]]

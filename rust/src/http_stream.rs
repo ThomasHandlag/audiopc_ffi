@@ -15,13 +15,16 @@ impl HttpStream {
         let client = Client::new();
         let url = reqwest::Url::parse(url_str).map_err(|e| format!("Invalid URL: {e}"))?;
 
-        let head_res = client.head(url.clone()).send()
-            .map_err(|e| format!("Failed to send HEAD request: {e}"))?;
-
-        let len = head_res.headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|val| val.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
+        let len = client
+            .head(url.clone())
+            .send()
+            .ok()
+            .and_then(|res| {
+                res.headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|val| val.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+            });
 
         Ok(Self {
             url,
