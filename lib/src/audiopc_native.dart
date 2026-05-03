@@ -303,6 +303,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   /// Sets high-pass cutoff in Hz. Use 0 to disable filtering.
   ///
   /// A high-pass filter allows frequencies above the specified cutoff frequency to pass through while attenuating frequencies below it.
+  @override
   bool setHighPassHz(double hz) {
     final code = bindings.audiopc_set_high_pass_filter(
       hz,
@@ -332,6 +333,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   /// which affects the bandwidth of the boost or cut around the center frequency.
   /// A higher Q value results in a narrower bandwidth,
   /// while a lower Q value results in a wider bandwidth.
+  @override
   bool setPeakFilter(double centerHz, double gainDb, double q) {
     final code = bindings.audiopc_set_peak_filter(centerHz, gainDb, q);
     return _ok(code);
@@ -348,6 +350,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   ///
   /// The `q` parameter controls the quality factor of the filter,
   /// which affects the slope of the boost or cut around the cutoff frequency.
+  @override
   bool setLowShelfFilter(double cutoffHz, double gainDb, double q) {
     final code = bindings.audiopc_set_low_shelf_filter(cutoffHz, gainDb, q);
     return _ok(code);
@@ -365,6 +368,7 @@ class AudiopcNative with PlayerStateMixin implements AudiopcInterface {
   /// The `q` parameter controls the quality factor of the filter,
   /// which affects the slope of the boost or cut around the cutoff frequency.
   /// A higher Q value results in a steeper slope, while a lower Q value results in a gentler slope.
+  @override
   bool setHighShelfFilter(double cutoffHz, double gainDb, double q) {
     final code = bindings.audiopc_set_high_shelf_filter(cutoffHz, gainDb, q);
     return _ok(code);
