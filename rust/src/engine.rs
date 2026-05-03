@@ -53,7 +53,7 @@ use crate::enums::{
     DECODE_BACKPRESSURE_SLEEP_MS, DEFAULT_VISUALIZER_BAR_COUNT, MAX_RATE, MIN_RATE,
 };
 use crate::error::AudioError;
-use crate::events::{event_channel, AudioEvent, EventSender};
+use crate::events::{event_channel};
 use crate::http_stream::HttpStream;
 use crate::player_state::{PlaybackStatus, PlayerState, ResampleState, SharedPlayback};
 use crate::processor::VisualizerProcessor;
