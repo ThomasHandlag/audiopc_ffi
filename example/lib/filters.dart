@@ -39,23 +39,26 @@ class _FilterControlsState extends State<FilterControls> {
               value: peak,
               onChanged: (value) {
                 setState(() {
-                  peak = value.clamp(20, 20000);
+                  peak = value.clamp(10, 20000);
                 });
 
                 player.setPeakFilter(peak, q, gainDB);
               },
+              divisions: 10,
               label: 'Peak frequency',
               max: 20000,
+              min: 10
             ),
             const Text('Low Shelving'),
             Slider(
               value: lowShelf,
               onChanged: (value) {
                 setState(() {
-                  lowShelf = value.clamp(20, 20000);
+                  lowShelf = value.clamp(10, 20000);
                 });
                 player.setLowShelfFilter(lowShelf, q, gainDB);
               },
+              divisions: 100,
               label: 'Low shelf frequency',
               max: 20000,
             ),
@@ -64,24 +67,26 @@ class _FilterControlsState extends State<FilterControls> {
               value: highShelf,
               onChanged: (value) {
                 setState(() {
-                  highShelf = value.clamp(20, 20000);
+                  highShelf = value.clamp(10, 20000);
                 });
                 player.setHighShelfFilter(highShelf, q, gainDB);
               },
               label: 'High shelf frequency',
               max: 20000,
+              divisions: 100,
             ),
             const Text('Band-pass'),
             Slider(
               value: bandPass,
               onChanged: (value) {
                 setState(() {
-                  bandPass = value.clamp(20, 20000);
+                  bandPass = value.clamp(10, 20000);
                 });
 
                 player.setBandPassFilter(bandPass, q);
               },
               label: 'Band-pass frequency',
+              divisions: 100,
               max: 20000,
             ),
             const Text('Notch'),
@@ -89,11 +94,12 @@ class _FilterControlsState extends State<FilterControls> {
               value: notch,
               onChanged: (value) {
                 setState(() {
-                  notch = value.clamp(20, 20000);
+                  notch = value.clamp(10, 20000);
                 });
-                player.setNotchFilter(notch, q);
+                player.setNotchFilter(notch, q, 0);
               },
               label: 'Notch frequency',
+              divisions: 100,
               max: 20000,
             ),
             const Text('Q factor'),
@@ -118,7 +124,8 @@ class _FilterControlsState extends State<FilterControls> {
               },
               label: 'Gain',
               max: 30,
-              min: -30,
+              divisions: 100,
+              min: .1,
             ),
             ElevatedButton(
               onPressed: player.clearFilter,
