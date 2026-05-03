@@ -1,5 +1,9 @@
 # Plugin change logs
 
+## VERSION 0.0.3
+
+* migrate to audiopc_inteface new version
+
 ## VERSION 0.0.2
 
 * Remove un-necessary event sender in rust impl
