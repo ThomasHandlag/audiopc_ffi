@@ -1,5 +1,9 @@
 # Plugin change logs
 
+## VERSION 0.0.3+1
+
+* Fix: mismatch android package name
+
 ## VERSION 0.0.3
 
 * migrate to audiopc_inteface new version

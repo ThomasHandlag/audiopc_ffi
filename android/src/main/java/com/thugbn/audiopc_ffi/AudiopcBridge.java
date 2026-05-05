@@ -1,4 +1,4 @@
-package com.example.audiopc_ffi;
+package com.thugbn.audiopc_ffi;
 
 import android.content.Context;
 
